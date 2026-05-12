@@ -9,7 +9,7 @@ python -m pip install -r requirements.txt
 python registro_ponto_manual.py
 ```
 
-## Gerar executavel sem Python na sua maquina
+## Gerar versao portatil sem Python na sua maquina
 
 A opcao recomendada para quem nao pode instalar Python e usar o GitHub Actions:
 
@@ -17,6 +17,7 @@ A opcao recomendada para quem nao pode instalar Python e usar o GitHub Actions:
 2. Abra a aba `Actions`.
 3. Rode o workflow `Build Windows EXE`.
 4. Baixe o artefato `RegistroPontoManual-Windows`.
+5. Extraia o ZIP e execute `RegistroPontoManual.exe` mantendo a pasta `_internal` junto dele.
 
 Veja o passo a passo em [COMO_GERAR_EXE_SEM_PYTHON.md](COMO_GERAR_EXE_SEM_PYTHON.md).
 
@@ -31,7 +32,7 @@ build_exe.bat
 O executavel sera gerado em:
 
 ```text
-dist\RegistroPontoManual.exe
+dist\RegistroPontoManual\RegistroPontoManual.exe
 ```
 
 ## Onde ficam os dados
