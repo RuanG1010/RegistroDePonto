@@ -54,7 +54,9 @@ BACKUP_DIR.mkdir(exist_ok=True)
 CONFIG_PADRAO = {
     "entrada_padrao": "08:00",
     "saida_padrao": "18:00",
+    "saida_padrao_sexta": "17:00",
     "jornada_minutos": 540,
+    "jornada_sexta_minutos": 480,
     "intervalo_minimo_minutos": 60,
     "tolerancia_entrada_minutos": 5,
     "tolerancia_saida_minutos": 5,
@@ -69,13 +71,58 @@ CONFIG_PADRAO = {
 
 
 def parse_hora(valor: str):
-    valor = (valor or "").strip()
+    valor = normalizar_hora(valor)
     if not valor:
         return None
     try:
         return datetime.strptime(valor, "%H:%M").time()
     except ValueError:
-        raise ValueError(f"Horario invalido: {valor}. Use HH:MM, exemplo: 08:00")
+        raise ValueError(f"Horario invalido: {valor}. Use HH:MM ou HHMM, exemplo: 08:00 ou 0800")
+
+
+def normalizar_hora(valor: str):
+    valor = (valor or "").strip().lower().replace(" ", "")
+    if not valor:
+        return ""
+
+    valor = valor.replace("h", ":")
+    if valor.endswith(":"):
+        valor = valor[:-1]
+
+    if ":" in valor:
+        partes = valor.split(":")
+        if len(partes) != 2 or not partes[0].isdigit() or not partes[1].isdigit():
+            raise ValueError(f"Horario invalido: {valor}. Use HH:MM ou HHMM, exemplo: 08:00 ou 0800")
+        hora = int(partes[0])
+        minuto = int(partes[1])
+    else:
+        if not valor.isdigit() or len(valor) > 4:
+            raise ValueError(f"Horario invalido: {valor}. Use HH:MM ou HHMM, exemplo: 08:00 ou 0800")
+        if len(valor) <= 2:
+            hora = int(valor)
+            minuto = 0
+        elif len(valor) == 3:
+            hora = int(valor[0])
+            minuto = int(valor[1:])
+        else:
+            hora = int(valor[:2])
+            minuto = int(valor[2:])
+
+    if hora > 23 or minuto > 59:
+        raise ValueError(f"Horario invalido: {valor}. Use uma hora entre 00:00 e 23:59")
+    return f"{hora:02d}:{minuto:02d}"
+
+
+def jornada_minutos_para_data(d: date):
+    if d.weekday() == 4:
+        return int(CONFIG.get("jornada_sexta_minutos", 480))
+    return int(CONFIG["jornada_minutos"])
+
+
+def saida_padrao_para_data(d: date):
+    if d.weekday() == 4:
+        return CONFIG.get("saida_padrao_sexta", "17:00")
+    return CONFIG["saida_padrao"]
 
 
 def parse_data(valor: str):
@@ -125,17 +172,20 @@ def validar_config(config):
     normalizada = CONFIG_PADRAO.copy()
     normalizada.update(config or {})
 
-    normalizada["entrada_padrao"] = str(normalizada["entrada_padrao"]).strip()
-    normalizada["saida_padrao"] = str(normalizada["saida_padrao"]).strip()
+    normalizada["entrada_padrao"] = normalizar_hora(normalizada["entrada_padrao"])
+    normalizada["saida_padrao"] = normalizar_hora(normalizada["saida_padrao"])
+    normalizada["saida_padrao_sexta"] = normalizar_hora(normalizada["saida_padrao_sexta"])
     if not normalizada["entrada_padrao"]:
         raise ValueError("Configuracao invalida para entrada_padrao. Use HH:MM.")
     if not normalizada["saida_padrao"]:
         raise ValueError("Configuracao invalida para saida_padrao. Use HH:MM.")
     parse_hora(normalizada["entrada_padrao"])
     parse_hora(normalizada["saida_padrao"])
+    parse_hora(normalizada["saida_padrao_sexta"])
 
     campos_inteiros_minimos = {
         "jornada_minutos": 1,
+        "jornada_sexta_minutos": 1,
         "intervalo_minimo_minutos": 0,
         "tolerancia_entrada_minutos": 0,
         "tolerancia_saida_minutos": 0,
@@ -317,7 +367,7 @@ def calcular_registro(reg):
             and not feriado
             and CONFIG.get("dias_uteis_sem_lancamento_geram_debito", True)
         ):
-            saldo = -int(CONFIG["jornada_minutos"])
+            saldo = -jornada_minutos_para_data(d)
             desconto = saldo
             status = "Pendente"
             avisos.append("Dia util sem lancamento contabilizado como debito.")
@@ -370,7 +420,7 @@ def calcular_registro(reg):
     tarde = saida_min - volta_almoco_min
     trabalhado_liquido = manha + tarde
 
-    saldo = trabalhado_liquido - int(CONFIG["jornada_minutos"])
+    saldo = trabalhado_liquido - jornada_minutos_para_data(d)
 
     entrada_padrao = minutos_do_dia(parse_hora(CONFIG["entrada_padrao"]))
     tol_entrada = int(CONFIG["tolerancia_entrada_minutos"])
@@ -380,7 +430,7 @@ def calcular_registro(reg):
             saldo -= diferenca_entrada
             avisos.append(f"Tolerancia de entrada aplicada: {abs(diferenca_entrada)} min.")
 
-    saida_padrao = minutos_do_dia(parse_hora(CONFIG["saida_padrao"]))
+    saida_padrao = minutos_do_dia(parse_hora(saida_padrao_para_data(d)))
     tol_saida = int(CONFIG["tolerancia_saida_minutos"])
     if saida_padrao - tol_saida <= saida_min <= saida_padrao + tol_saida:
         diferenca_saida = saida_min - saida_padrao
@@ -467,10 +517,10 @@ def periodo_fechamento(ref: date):
 
 def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriado, observacao):
     d = parse_data(data_txt)
-    entrada = entrada or ""
-    saida_almoco = saida_almoco or ""
-    volta_almoco = volta_almoco or ""
-    saida = saida or ""
+    entrada = normalizar_hora(entrada)
+    saida_almoco = normalizar_hora(saida_almoco)
+    volta_almoco = normalizar_hora(volta_almoco)
+    saida = normalizar_hora(saida)
     observacao = observacao or ""
 
     for h in [entrada, saida_almoco, volta_almoco, saida]:
@@ -758,7 +808,9 @@ class ConfigWindow(tk.Toplevel):
         campos = [
             ("entrada_padrao", "Entrada padrao, ex: 08:00"),
             ("saida_padrao", "Saida padrao, ex: 18:00"),
+            ("saida_padrao_sexta", "Saida padrao sexta, ex: 17:00"),
             ("jornada_minutos", "Jornada diaria em minutos"),
+            ("jornada_sexta_minutos", "Jornada sexta em minutos"),
             ("intervalo_minimo_minutos", "Intervalo minimo em minutos"),
             ("tolerancia_entrada_minutos", "Tolerancia de entrada em minutos"),
             ("tolerancia_saida_minutos", "Tolerancia de saida em minutos"),
@@ -811,9 +863,8 @@ class ConfigWindow(tk.Toplevel):
         try:
             for chave, var in self.vars.items():
                 valor = var.get().strip()
-                if chave in ["entrada_padrao", "saida_padrao"]:
-                    parse_hora(valor)
-                    novo[chave] = valor
+                if chave in ["entrada_padrao", "saida_padrao", "saida_padrao_sexta"]:
+                    novo[chave] = normalizar_hora(valor)
                 elif chave == "estado_feriados":
                     novo[chave] = valor.upper()
                 else:
@@ -999,11 +1050,12 @@ class RegistroPontoApp(tk.Tk):
         rodape.pack(anchor="w", pady=(6, 0))
 
     def preencher_formulario_padrao(self, d=None):
-        self.data_var.set(data_br(d or date.today()))
+        d = d or date.today()
+        self.data_var.set(data_br(d))
         self.entrada_var.set(CONFIG["entrada_padrao"])
         self.saida_almoco_var.set("13:00")
         self.volta_almoco_var.set("14:00")
-        self.saida_var.set(CONFIG["saida_padrao"])
+        self.saida_var.set(saida_padrao_para_data(d))
         self.feriado_var.set(False)
         self.obs_var.set("")
 
