@@ -6,6 +6,7 @@ from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 import shutil
 import json
+import re
 
 # Dependencias opcionais para exportacao.
 # Instale com:
@@ -66,6 +67,7 @@ CONFIG_PADRAO = {
     "fechamento_fim_dia": 15,
     "considerar_feriados_automaticos": True,
     "estado_feriados": "SP",
+    "municipio_feriados": "SAO PAULO",
     "dias_uteis_sem_lancamento_geram_debito": True,
 }
 
@@ -209,6 +211,9 @@ def validar_config(config):
             raise ValueError(f"Configuracao invalida para {chave}. Use um dia entre 1 e 31.")
 
     normalizada["estado_feriados"] = (str(normalizada.get("estado_feriados") or "SP").strip().upper() or "SP")
+    normalizada["municipio_feriados"] = (
+        str(normalizada.get("municipio_feriados") or "SAO PAULO").strip().upper() or "SAO PAULO"
+    )
     normalizada["considerar_feriados_automaticos"] = normalizar_booleano(
         normalizada.get("considerar_feriados_automaticos", True)
     )
@@ -297,8 +302,8 @@ def pascoa(ano: int):
 
 def feriados_automaticos(ano: int):
     """
-    Feriados nacionais + estaduais de SP mais usados.
-    Observacao: feriados municipais, pontos facultativos e regras internas
+    Feriados nacionais + estadual/municipais de Sao Paulo/SP.
+    Observacao: pontos facultativos, emendas e regras internas
     devem ser tratados manualmente.
     """
     p = pascoa(ano)
@@ -312,15 +317,16 @@ def feriados_automaticos(ano: int):
         date(ano, 11, 15): "Proclamacao da Republica",
         date(ano, 11, 20): "Consciencia Negra",
         date(ano, 12, 25): "Natal",
-        p - timedelta(days=48): "Carnaval - segunda-feira",
-        p - timedelta(days=47): "Carnaval - terca-feira",
-        p - timedelta(days=46): "Quarta-feira de Cinzas",
         p - timedelta(days=2): "Sexta-feira Santa",
-        p + timedelta(days=60): "Corpus Christi",
     }
 
     if CONFIG.get("estado_feriados", "SP").upper() == "SP":
         feriados[date(ano, 7, 9)] = "Revolucao Constitucionalista - SP"
+
+    municipio = CONFIG.get("municipio_feriados", "SAO PAULO").upper()
+    if municipio in {"SAO PAULO", "SÃO PAULO", "SP", "SAO PAULO/SP", "SÃO PAULO/SP"}:
+        feriados[date(ano, 1, 25)] = "Aniversario da Cidade de Sao Paulo"
+        feriados[p + timedelta(days=60)] = "Corpus Christi"
 
     return feriados
 
@@ -385,17 +391,23 @@ def calcular_registro(reg):
         }
 
     if not all([entrada, saida_almoco, volta_almoco, saida]):
-        return {
-            "trabalhado_liquido": 0,
-            "intervalo": 0,
-            "saldo_total": 0,
-            "banco": 0,
-            "extra": 0,
-            "desconto": 0,
-            "status": "Incompleto",
-            "avisos": "Preencha entrada, saida almoco, volta almoco e saida.",
-            "feriado_calculado": feriado,
-        }
+        if d == date.today() and entrada and eh_dia_util(d) and not feriado:
+            saida_almoco = saida_almoco or parse_hora("13:00")
+            volta_almoco = volta_almoco or parse_hora("14:00")
+            saida = saida or parse_hora(saida_padrao_para_data(d))
+            avisos.append("Previsao do dia usando os horarios padrao restantes.")
+        else:
+            return {
+                "trabalhado_liquido": 0,
+                "intervalo": 0,
+                "saldo_total": 0,
+                "banco": 0,
+                "extra": 0,
+                "desconto": 0,
+                "status": "Incompleto",
+                "avisos": "Preencha entrada, saida almoco, volta almoco e saida.",
+                "feriado_calculado": feriado,
+            }
 
     entrada_min = minutos_do_dia(entrada)
     saida_almoco_min = minutos_do_dia(saida_almoco)
@@ -552,6 +564,36 @@ def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriad
             ),
         )
         conn.commit()
+
+
+def importar_texto_portal(texto: str):
+    padrao_data = re.compile(r"^(Seg|Ter|Qua|Qui|Sex|Sab|Dom)\.\s+(\d{2}/\d{2}/\d{4})(.*)$", re.IGNORECASE)
+    registros = []
+
+    for linha in (texto or "").splitlines():
+        linha = linha.strip()
+        match = padrao_data.match(linha)
+        if not match:
+            continue
+
+        data_txt = match.group(2)
+        marcacoes_txt = match.group(3)
+        horarios = re.findall(r"\d{2}:\d{2}", marcacoes_txt)
+
+        campos = (horarios + ["", "", "", ""])[:4]
+        observacao = "Importado do portal SGO"
+        if len(horarios) not in (0, 4):
+            observacao = "Marcacoes invalidas no portal; importado parcialmente"
+
+        registros.append((data_txt, *campos, False, observacao))
+
+    if not registros:
+        raise ValueError("Nenhuma linha com data e marcacoes foi encontrada no texto colado.")
+
+    for registro in registros:
+        salvar_registro(*registro)
+
+    return len(registros)
 
 
 def excluir_registro(data_txt):
@@ -819,6 +861,7 @@ class ConfigWindow(tk.Toplevel):
             ("fechamento_inicio_dia", "Dia inicial do fechamento"),
             ("fechamento_fim_dia", "Dia final do fechamento"),
             ("estado_feriados", "Estado dos feriados, ex: SP"),
+            ("municipio_feriados", "Municipio dos feriados, ex: SAO PAULO"),
         ]
 
         for i, (chave, label) in enumerate(campos, start=1):
@@ -867,6 +910,8 @@ class ConfigWindow(tk.Toplevel):
                     novo[chave] = normalizar_hora(valor)
                 elif chave == "estado_feriados":
                     novo[chave] = valor.upper()
+                elif chave == "municipio_feriados":
+                    novo[chave] = valor.upper()
                 else:
                     novo[chave] = int(valor)
 
@@ -881,6 +926,58 @@ class ConfigWindow(tk.Toplevel):
             self.destroy()
         except Exception as e:
             messagebox.showerror("Erro", str(e))
+
+
+class ImportPortalWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.master = master
+        self.title("Importar portal SGO")
+        self.geometry("760x560")
+        self.minsize(640, 420)
+
+        self._montar()
+        self.transient(master)
+        self.grab_set()
+
+    def _montar(self):
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Cole aqui o texto copiado da tela Gestao de Ponto do portal.",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        texto_frame = ttk.Frame(frame)
+        texto_frame.pack(fill="both", expand=True)
+
+        self.texto = tk.Text(texto_frame, wrap="none", height=18)
+        yscroll = ttk.Scrollbar(texto_frame, orient="vertical", command=self.texto.yview)
+        xscroll = ttk.Scrollbar(texto_frame, orient="horizontal", command=self.texto.xview)
+        self.texto.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        self.texto.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        texto_frame.rowconfigure(0, weight=1)
+        texto_frame.columnconfigure(0, weight=1)
+
+        botoes = ttk.Frame(frame)
+        botoes.pack(fill="x", pady=(10, 0))
+        ttk.Button(botoes, text="Importar", command=self.importar).pack(side="right", padx=4)
+        ttk.Button(botoes, text="Cancelar", command=self.destroy).pack(side="right", padx=4)
+
+    def importar(self):
+        try:
+            total = importar_texto_portal(self.texto.get("1.0", "end"))
+            self.master.carregar_dia()
+            self.master.atualizar_resumo()
+            messagebox.showinfo("Importacao concluida", f"{total} dias importados do portal.")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Erro ao importar", str(e))
 
 
 class RegistroPontoApp(tk.Tk):
@@ -927,6 +1024,7 @@ class RegistroPontoApp(tk.Tk):
         ttk.Button(topo, text="Backup", command=self.backup).pack(side="right", padx=4)
         ttk.Button(topo, text="Exportar PDF", command=self.exportar_pdf_ui).pack(side="right", padx=4)
         ttk.Button(topo, text="Exportar Excel", command=self.exportar_excel_ui).pack(side="right", padx=4)
+        ttk.Button(topo, text="Importar Portal", command=self.importar_portal).pack(side="right", padx=4)
 
         subtitulo = ttk.Label(
             container,
@@ -1125,6 +1223,9 @@ class RegistroPontoApp(tk.Tk):
 
     def abrir_configuracoes(self):
         ConfigWindow(self)
+
+    def importar_portal(self):
+        ImportPortalWindow(self)
 
     def backup(self):
         try:
