@@ -58,7 +58,10 @@ CONFIG_PADRAO = {
     "saida_padrao_sexta": "17:00",
     "jornada_minutos": 540,
     "jornada_sexta_minutos": 480,
+    "jornada_maxima_diaria_minutos": 600,
     "intervalo_minimo_minutos": 60,
+    "intervalo_maximo_minutos": 120,
+    "interjornada_minima_minutos": 660,
     "tolerancia_entrada_minutos": 5,
     "tolerancia_saida_minutos": 5,
     "limite_banco_seg_a_qui_minutos": 60,
@@ -160,6 +163,12 @@ def hora_para_texto(minutos: int):
     return f"{sinal}{h:02d}:{m:02d}"
 
 
+def adicionar_aviso(calc, aviso):
+    atual = calc.get("avisos") or ""
+    calc["avisos"] = f"{atual} | {aviso}" if atual else aviso
+    return calc
+
+
 def texto_para_minutos_saldo(valor: str):
     valor = (valor or "").strip().lower().replace("h", "")
     if not valor:
@@ -210,7 +219,10 @@ def validar_config(config):
     campos_inteiros_minimos = {
         "jornada_minutos": 1,
         "jornada_sexta_minutos": 1,
+        "jornada_maxima_diaria_minutos": 1,
         "intervalo_minimo_minutos": 0,
+        "intervalo_maximo_minutos": 0,
+        "interjornada_minima_minutos": 0,
         "tolerancia_entrada_minutos": 0,
         "tolerancia_saida_minutos": 0,
         "limite_banco_seg_a_qui_minutos": 0,
@@ -513,10 +525,23 @@ def calcular_registro(reg):
             saldo -= diferenca_saida
             avisos.append(f"Tolerancia de saida aplicada: {abs(diferenca_saida)} min.")
 
-    if intervalo < int(CONFIG["intervalo_minimo_minutos"]):
+    intervalo_minimo = int(CONFIG["intervalo_minimo_minutos"])
+    intervalo_maximo = int(CONFIG.get("intervalo_maximo_minutos", 120))
+    jornada_maxima = int(CONFIG.get("jornada_maxima_diaria_minutos", 600))
+
+    if intervalo < intervalo_minimo:
         avisos.append(
             f"Intervalo menor que 1h: {hora_para_texto(intervalo)}. "
-            "A diferenca conta como tempo trabalhado."
+            "Politica exige minimo de 1h para jornadas acima de 6h."
+        )
+    if intervalo_maximo and intervalo > intervalo_maximo:
+        avisos.append(
+            f"Intervalo maior que 2h: {hora_para_texto(intervalo)}. "
+            "Politica limita intervalo de refeicao/descanso a 2h."
+        )
+    if trabalhado_liquido > jornada_maxima:
+        avisos.append(
+            f"Jornada acima do limite diario de 10h: {hora_para_texto(trabalhado_liquido)}."
         )
 
     if d.weekday() == 5:
@@ -724,6 +749,7 @@ def montar_linhas_fechamento(inicio: date, fim: date):
     registros = buscar_registros(inicio, fim)
     regs_por_data = {r["data"]: r for r in registros}
     linhas = []
+    ultima_saida = None
     totais = {
         "trabalhado": 0,
         "saldo": 0,
@@ -745,6 +771,25 @@ def montar_linhas_fechamento(inicio: date, fim: date):
             saida = reg.get("saida") or ""
             feriado = "Sim" if calc.get("feriado_calculado") else "Nao"
             obs = reg.get("observacao") or ""
+
+            if ultima_saida and entrada:
+                try:
+                    entrada_atual = datetime.combine(atual, parse_hora(entrada))
+                    descanso = int((entrada_atual - ultima_saida).total_seconds() // 60)
+                    minimo = int(CONFIG.get("interjornada_minima_minutos", 660))
+                    if 0 <= descanso < minimo:
+                        adicionar_aviso(
+                            calc,
+                            f"Interjornada menor que 11h: {hora_para_texto(descanso)}.",
+                        )
+                except Exception:
+                    pass
+
+            if saida:
+                try:
+                    ultima_saida = datetime.combine(atual, parse_hora(saida))
+                except Exception:
+                    pass
         else:
             fake = {
                 "data": data_iso(atual),
@@ -949,7 +994,10 @@ class ConfigWindow(tk.Toplevel):
             ("saida_padrao_sexta", "Saida padrao sexta, ex: 17:00"),
             ("jornada_minutos", "Jornada diaria em minutos"),
             ("jornada_sexta_minutos", "Jornada sexta em minutos"),
+            ("jornada_maxima_diaria_minutos", "Limite diario em minutos"),
             ("intervalo_minimo_minutos", "Intervalo minimo em minutos"),
+            ("intervalo_maximo_minutos", "Intervalo maximo em minutos"),
+            ("interjornada_minima_minutos", "Interjornada minima em minutos"),
             ("tolerancia_entrada_minutos", "Tolerancia de entrada em minutos"),
             ("tolerancia_saida_minutos", "Tolerancia de saida em minutos"),
             ("limite_banco_seg_a_qui_minutos", "Banco seg. a qui. em minutos"),
@@ -985,8 +1033,9 @@ class ConfigWindow(tk.Toplevel):
         ttk.Button(botoes, text="Cancelar", command=self.destroy).pack(side="left", padx=5)
 
         aviso = (
-            "Observacao: feriados municipais, pontos facultativos e regras internas especificas "
-            "devem ser marcados manualmente no lancamento do dia, caso necessario."
+            "Politica aplicada: 44h semanais, intervalo de 1h a 2h, limite diario de 10h "
+            "e interjornada minima de 11h. Pontos facultativos, emendas e abonos devem ser "
+            "tratados manualmente quando necessario."
         )
         ttk.Label(frame, text=aviso, wraplength=510, foreground="#555555").grid(
             row=len(campos) + 4,
