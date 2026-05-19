@@ -58,7 +58,10 @@ CONFIG_PADRAO = {
     "saida_padrao_sexta": "17:00",
     "jornada_minutos": 540,
     "jornada_sexta_minutos": 480,
+    "jornada_maxima_diaria_minutos": 600,
     "intervalo_minimo_minutos": 60,
+    "intervalo_maximo_minutos": 120,
+    "interjornada_minima_minutos": 660,
     "tolerancia_entrada_minutos": 5,
     "tolerancia_saida_minutos": 5,
     "limite_banco_seg_a_qui_minutos": 60,
@@ -160,6 +163,34 @@ def hora_para_texto(minutos: int):
     return f"{sinal}{h:02d}:{m:02d}"
 
 
+def adicionar_aviso(calc, aviso):
+    atual = calc.get("avisos") or ""
+    calc["avisos"] = f"{atual} | {aviso}" if atual else aviso
+    return calc
+
+
+def texto_para_minutos_saldo(valor: str):
+    valor = (valor or "").strip().lower().replace("h", "")
+    if not valor:
+        return None
+    sinal = -1 if valor.startswith("-") else 1
+    valor = valor.lstrip("+-")
+    t = parse_hora(valor)
+    if not t:
+        return None
+    return sinal * minutos_do_dia(t)
+
+
+def saldo_oficial_do_registro(reg):
+    valor = reg.get("saldo_oficial_minutos")
+    if valor in (None, ""):
+        return None
+    try:
+        return int(valor)
+    except Exception:
+        return None
+
+
 def normalizar_booleano(valor):
     if isinstance(valor, bool):
         return valor
@@ -188,7 +219,10 @@ def validar_config(config):
     campos_inteiros_minimos = {
         "jornada_minutos": 1,
         "jornada_sexta_minutos": 1,
+        "jornada_maxima_diaria_minutos": 1,
         "intervalo_minimo_minutos": 0,
+        "intervalo_maximo_minutos": 0,
+        "interjornada_minima_minutos": 0,
         "tolerancia_entrada_minutos": 0,
         "tolerancia_saida_minutos": 0,
         "limite_banco_seg_a_qui_minutos": 0,
@@ -263,12 +297,16 @@ def criar_banco():
                 volta_almoco TEXT,
                 saida TEXT,
                 feriado INTEGER DEFAULT 0,
+                saldo_oficial_minutos INTEGER,
                 observacao TEXT,
                 criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
                 atualizado_em TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        colunas = [row[1] for row in conn.execute("PRAGMA table_info(registros)").fetchall()]
+        if "saldo_oficial_minutos" not in colunas:
+            conn.execute("ALTER TABLE registros ADD COLUMN saldo_oficial_minutos INTEGER")
         conn.commit()
 
 
@@ -346,6 +384,7 @@ def calcular_registro(reg):
     feriado_manual = int(reg.get("feriado") or 0) == 1
     feriado_auto_nome = nome_feriado_auto(d)
     feriado = feriado_manual or bool(feriado_auto_nome)
+    saldo_oficial = saldo_oficial_do_registro(reg)
 
     entrada = parse_hora(reg.get("entrada"))
     saida_almoco = parse_hora(reg.get("saida_almoco"))
@@ -378,6 +417,12 @@ def calcular_registro(reg):
             status = "Pendente"
             avisos.append("Dia util sem lancamento contabilizado como debito.")
 
+        if saldo_oficial is not None:
+            saldo = saldo_oficial
+            desconto = min(0, saldo)
+            status = "Feriado" if feriado and saldo == 0 else ("Pendente" if saldo < 0 else "Banco positivo" if saldo > 0 else "OK")
+            avisos.append("Saldo diario oficial do portal aplicado.")
+
         return {
             "trabalhado_liquido": 0,
             "intervalo": 0,
@@ -396,7 +441,7 @@ def calcular_registro(reg):
             volta_almoco = volta_almoco or parse_hora("14:00")
             saida = saida or parse_hora(saida_padrao_para_data(d))
             avisos.append("Previsao do dia usando os horarios padrao restantes.")
-        else:
+        elif saldo_oficial is None:
             return {
                 "trabalhado_liquido": 0,
                 "intervalo": 0,
@@ -406,6 +451,36 @@ def calcular_registro(reg):
                 "desconto": 0,
                 "status": "Incompleto",
                 "avisos": "Preencha entrada, saida almoco, volta almoco e saida.",
+                "feriado_calculado": feriado,
+            }
+        else:
+            banco = 0
+            extra = 0
+            desconto = 0
+            if saldo_oficial < 0:
+                desconto = saldo_oficial
+                status = "Banco negativo"
+            elif saldo_oficial > 0:
+                limite_banco = (
+                    int(CONFIG["limite_banco_sexta_minutos"])
+                    if d.weekday() == 4
+                    else int(CONFIG["limite_banco_seg_a_qui_minutos"])
+                )
+                banco = min(saldo_oficial, limite_banco)
+                extra = max(0, saldo_oficial - limite_banco)
+                status = "Banco positivo" if extra == 0 else "Banco + Extra"
+            else:
+                status = "OK"
+            avisos.append("Marcacoes incompletas; saldo diario oficial do portal aplicado.")
+            return {
+                "trabalhado_liquido": 0,
+                "intervalo": 0,
+                "saldo_total": saldo_oficial,
+                "banco": banco,
+                "extra": extra,
+                "desconto": desconto,
+                "status": status,
+                "avisos": " | ".join(avisos),
                 "feriado_calculado": feriado,
             }
 
@@ -450,10 +525,23 @@ def calcular_registro(reg):
             saldo -= diferenca_saida
             avisos.append(f"Tolerancia de saida aplicada: {abs(diferenca_saida)} min.")
 
-    if intervalo < int(CONFIG["intervalo_minimo_minutos"]):
+    intervalo_minimo = int(CONFIG["intervalo_minimo_minutos"])
+    intervalo_maximo = int(CONFIG.get("intervalo_maximo_minutos", 120))
+    jornada_maxima = int(CONFIG.get("jornada_maxima_diaria_minutos", 600))
+
+    if intervalo < intervalo_minimo:
         avisos.append(
             f"Intervalo menor que 1h: {hora_para_texto(intervalo)}. "
-            "A diferenca conta como tempo trabalhado."
+            "Politica exige minimo de 1h para jornadas acima de 6h."
+        )
+    if intervalo_maximo and intervalo > intervalo_maximo:
+        avisos.append(
+            f"Intervalo maior que 2h: {hora_para_texto(intervalo)}. "
+            "Politica limita intervalo de refeicao/descanso a 2h."
+        )
+    if trabalhado_liquido > jornada_maxima:
+        avisos.append(
+            f"Jornada acima do limite diario de 10h: {hora_para_texto(trabalhado_liquido)}."
         )
 
     if d.weekday() == 5:
@@ -465,6 +553,10 @@ def calcular_registro(reg):
     # Se trabalhar, o saldo vira o total trabalhado.
     if (not eh_dia_util(d) or feriado) and trabalhado_liquido > 0:
         saldo = trabalhado_liquido
+
+    if saldo_oficial is not None:
+        saldo = saldo_oficial
+        avisos.append("Saldo diario oficial do portal aplicado.")
 
     banco = 0
     extra = 0
@@ -527,13 +619,17 @@ def periodo_fechamento(ref: date):
     return inicio, fim
 
 
-def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriado, observacao):
+def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriado, observacao, saldo_oficial_minutos=None):
     d = parse_data(data_txt)
     entrada = normalizar_hora(entrada)
     saida_almoco = normalizar_hora(saida_almoco)
     volta_almoco = normalizar_hora(volta_almoco)
     saida = normalizar_hora(saida)
     observacao = observacao or ""
+    if saldo_oficial_minutos in ("", None):
+        saldo_oficial_minutos = None
+    else:
+        saldo_oficial_minutos = int(saldo_oficial_minutos)
 
     for h in [entrada, saida_almoco, volta_almoco, saida]:
         if h.strip():
@@ -542,14 +638,15 @@ def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriad
     with conectar() as conn:
         conn.execute(
             """
-            INSERT INTO registros (data, entrada, saida_almoco, volta_almoco, saida, feriado, observacao)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO registros (data, entrada, saida_almoco, volta_almoco, saida, feriado, saldo_oficial_minutos, observacao)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(data) DO UPDATE SET
                 entrada=excluded.entrada,
                 saida_almoco=excluded.saida_almoco,
                 volta_almoco=excluded.volta_almoco,
                 saida=excluded.saida,
                 feriado=excluded.feriado,
+                saldo_oficial_minutos=excluded.saldo_oficial_minutos,
                 observacao=excluded.observacao,
                 atualizado_em=CURRENT_TIMESTAMP
             """,
@@ -560,6 +657,7 @@ def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriad
                 volta_almoco.strip(),
                 saida.strip(),
                 int(feriado),
+                saldo_oficial_minutos,
                 observacao.strip(),
             ),
         )
@@ -568,24 +666,47 @@ def salvar_registro(data_txt, entrada, saida_almoco, volta_almoco, saida, feriad
 
 def importar_texto_portal(texto: str):
     padrao_data = re.compile(r"^(Seg|Ter|Qua|Qui|Sex|Sab|Dom)\.\s+(\d{2}/\d{2}/\d{4})(.*)$", re.IGNORECASE)
+    padrao_saldo_linha = re.compile(r"^-?\d{2}:\d{2}h?$", re.IGNORECASE)
     registros = []
+    bloco_atual = None
+
+    def finalizar_bloco():
+        if not bloco_atual:
+            return
+
+        saldos = []
+        for item in bloco_atual["linhas"]:
+            item = item.strip()
+            if padrao_saldo_linha.match(item):
+                saldos.append(texto_para_minutos_saldo(item))
+
+        saldo_oficial = saldos[-1] if saldos else None
+        campos = (bloco_atual["horarios"] + ["", "", "", ""])[:4]
+        observacao = "Importado do portal SGO"
+        if saldo_oficial is not None:
+            observacao += f"; saldo diario oficial {hora_para_texto(saldo_oficial)}"
+        if len(bloco_atual["horarios"]) not in (0, 4):
+            observacao = "Marcacoes invalidas no portal; importado parcialmente"
+            if saldo_oficial is not None:
+                observacao += f"; saldo diario oficial {hora_para_texto(saldo_oficial)}"
+
+        registros.append((bloco_atual["data"], *campos, False, observacao, saldo_oficial))
 
     for linha in (texto or "").splitlines():
         linha = linha.strip()
         match = padrao_data.match(linha)
-        if not match:
+        if match:
+            finalizar_bloco()
+            data_txt = match.group(2)
+            marcacoes_txt = match.group(3)
+            horarios = re.findall(r"\d{2}:\d{2}", marcacoes_txt)
+            bloco_atual = {"data": data_txt, "horarios": horarios, "linhas": []}
             continue
 
-        data_txt = match.group(2)
-        marcacoes_txt = match.group(3)
-        horarios = re.findall(r"\d{2}:\d{2}", marcacoes_txt)
+        if bloco_atual:
+            bloco_atual["linhas"].append(linha)
 
-        campos = (horarios + ["", "", "", ""])[:4]
-        observacao = "Importado do portal SGO"
-        if len(horarios) not in (0, 4):
-            observacao = "Marcacoes invalidas no portal; importado parcialmente"
-
-        registros.append((data_txt, *campos, False, observacao))
+    finalizar_bloco()
 
     if not registros:
         raise ValueError("Nenhuma linha com data e marcacoes foi encontrada no texto colado.")
@@ -628,6 +749,7 @@ def montar_linhas_fechamento(inicio: date, fim: date):
     registros = buscar_registros(inicio, fim)
     regs_por_data = {r["data"]: r for r in registros}
     linhas = []
+    ultima_saida = None
     totais = {
         "trabalhado": 0,
         "saldo": 0,
@@ -649,6 +771,25 @@ def montar_linhas_fechamento(inicio: date, fim: date):
             saida = reg.get("saida") or ""
             feriado = "Sim" if calc.get("feriado_calculado") else "Nao"
             obs = reg.get("observacao") or ""
+
+            if ultima_saida and entrada:
+                try:
+                    entrada_atual = datetime.combine(atual, parse_hora(entrada))
+                    descanso = int((entrada_atual - ultima_saida).total_seconds() // 60)
+                    minimo = int(CONFIG.get("interjornada_minima_minutos", 660))
+                    if 0 <= descanso < minimo:
+                        adicionar_aviso(
+                            calc,
+                            f"Interjornada menor que 11h: {hora_para_texto(descanso)}.",
+                        )
+                except Exception:
+                    pass
+
+            if saida:
+                try:
+                    ultima_saida = datetime.combine(atual, parse_hora(saida))
+                except Exception:
+                    pass
         else:
             fake = {
                 "data": data_iso(atual),
@@ -853,7 +994,10 @@ class ConfigWindow(tk.Toplevel):
             ("saida_padrao_sexta", "Saida padrao sexta, ex: 17:00"),
             ("jornada_minutos", "Jornada diaria em minutos"),
             ("jornada_sexta_minutos", "Jornada sexta em minutos"),
+            ("jornada_maxima_diaria_minutos", "Limite diario em minutos"),
             ("intervalo_minimo_minutos", "Intervalo minimo em minutos"),
+            ("intervalo_maximo_minutos", "Intervalo maximo em minutos"),
+            ("interjornada_minima_minutos", "Interjornada minima em minutos"),
             ("tolerancia_entrada_minutos", "Tolerancia de entrada em minutos"),
             ("tolerancia_saida_minutos", "Tolerancia de saida em minutos"),
             ("limite_banco_seg_a_qui_minutos", "Banco seg. a qui. em minutos"),
@@ -889,8 +1033,9 @@ class ConfigWindow(tk.Toplevel):
         ttk.Button(botoes, text="Cancelar", command=self.destroy).pack(side="left", padx=5)
 
         aviso = (
-            "Observacao: feriados municipais, pontos facultativos e regras internas especificas "
-            "devem ser marcados manualmente no lancamento do dia, caso necessario."
+            "Politica aplicada: 44h semanais, intervalo de 1h a 2h, limite diario de 10h "
+            "e interjornada minima de 11h. Pontos facultativos, emendas e abonos devem ser "
+            "tratados manualmente quando necessario."
         )
         ttk.Label(frame, text=aviso, wraplength=510, foreground="#555555").grid(
             row=len(campos) + 4,
